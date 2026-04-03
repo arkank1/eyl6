@@ -1,0 +1,280 @@
+#!/usr/bin/env python
+from __future__ import print_function
+import sys
+import math
+import numpy as np
+import rospy
+import quadprog
+
+from sensor_msgs.msg import LaserScan
+from nav_msgs.msg import Odometry
+from ackermann_msgs.msg import AckermannDriveStamped
+
+
+class VirtualBarrierNavigation:
+    def __init__(self):
+        # Topics
+        scan_topic = rospy.get_param("scan_topic", "/scan")
+        odom_topic = rospy.get_param("odom_topic", "/odom")
+        drive_topic = rospy.get_param("drive_topic", "/drive")
+
+        # Vehicle/controller parameters
+        self.wheelbase = rospy.get_param("wheelbase", 0.287)
+        self.k_p = rospy.get_param("k_p", 4.0)
+        self.k_d = rospy.get_param("k_d", 3.0)
+        self.d_lr_des = rospy.get_param("d_lr_des", 0.0)
+        self.delta_max = rospy.get_param("delta_max", 0.41)
+
+        # Best-direction / barrier parameters
+        self.fov_deg = rospy.get_param("fov_deg", 70.0)                  # +/- FOV in front
+        self.safe_gap_dist = rospy.get_param("safe_gap_dist", 0.75)      # zero-out close obstacles
+        self.left_sector_inner_deg = rospy.get_param("left_sector_inner_deg", 25.0)
+        self.left_sector_outer_deg = rospy.get_param("left_sector_outer_deg", 90.0)
+        self.right_sector_inner_deg = rospy.get_param("right_sector_inner_deg", -25.0)
+        self.right_sector_outer_deg = rospy.get_param("right_sector_outer_deg", -90.0)
+        self.epsilon_s = rospy.get_param("epsilon_s", 0.01)
+        self.qp_reg = rospy.get_param("qp_reg", 1e-4)
+
+        # Velocity control parameters
+        self.v_s_desired = rospy.get_param("v_s_d", 0.8)
+        self.front_view_deg = rospy.get_param("front_view_deg", 12.0)
+        self.d_stop = rospy.get_param("d_stop", 0.6)
+        self.d_tau = rospy.get_param("d_tau", 1.0)
+
+        # Fallback / robustness
+        self.min_points_each_side = rospy.get_param("min_points_each_side", 3)
+        self.min_speed_for_steer = rospy.get_param("min_speed_for_steer", 0.25)
+
+        self.v_s = 0.0
+
+        rospy.Subscriber(scan_topic, LaserScan, self.lidar_callback, queue_size=1)
+        rospy.Subscriber(odom_topic, Odometry, self.odom_callback, queue_size=1)
+        self.drive_pub = rospy.Publisher(drive_topic, AckermannDriveStamped, queue_size=1)
+
+    def clamp(self, x, lo, hi):
+        return max(lo, min(hi, x))
+
+    def wrap_to_pi(self, angle):
+        while angle > math.pi:
+            angle -= 2.0 * math.pi
+        while angle < -math.pi:
+            angle += 2.0 * math.pi
+        return angle
+
+    def odom_callback(self, msg):
+        self.v_s = msg.twist.twist.linear.x
+
+    def lidar_callback(self, scan):
+        ranges = np.array(scan.ranges, dtype=float)
+        n = len(ranges)
+        angles = scan.angle_min + np.arange(n) * scan.angle_increment
+
+        valid = np.isfinite(ranges) & (ranges > 0.0)
+        if np.count_nonzero(valid) == 0:
+            return
+
+        # =========================================================
+        # Step 1: Find best direction of travel (Table 2)
+        # =========================================================
+        fov = math.radians(self.fov_deg)
+        in_front = valid & (angles >= -fov) & (angles <= fov)
+
+        free_mask = np.zeros(n, dtype=bool)
+        free_mask[in_front] = ranges[in_front] > self.safe_gap_dist
+
+        # Find longest consecutive non-zero sequence in the front FOV
+        best_start = -1
+        best_end = -1
+        best_len = 0
+        current_start = -1
+
+        idxs = np.where(in_front)[0]
+        for idx in idxs:
+            if free_mask[idx]:
+                if current_start == -1:
+                    current_start = idx
+            else:
+                if current_start != -1:
+                    curr_len = idx - current_start
+                    if curr_len > best_len:
+                        best_len = curr_len
+                        best_start = current_start
+                        best_end = idx - 1
+                    current_start = -1
+
+        if current_start != -1:
+            curr_len = idxs[-1] - current_start + 1
+            if curr_len > best_len:
+                best_len = curr_len
+                best_start = current_start
+                best_end = idxs[-1]
+
+        if best_start == -1 or best_end == -1:
+            theta_des = 0.0
+        else:
+            gap_idx = np.arange(best_start, best_end + 1)
+            gap_valid = valid[gap_idx]
+            if np.count_nonzero(gap_valid) == 0:
+                theta_des = 0.0
+            else:
+                r_gap = ranges[gap_idx][gap_valid]
+                a_gap = angles[gap_idx][gap_valid]
+                theta_des = float(np.sum(r_gap * a_gap) / np.sum(r_gap))
+
+        # =========================================================
+        # Step 2: Collect left/right obstacle points for QP
+        # Sectors are defined relative to theta_des (Fig. 4 / Table 3)
+        # =========================================================
+        rel_angles = np.array([self.wrap_to_pi(a - theta_des) for a in angles])
+
+        left_sector = (
+            valid
+            & (rel_angles >= math.radians(self.left_sector_inner_deg))
+            & (rel_angles <= math.radians(self.left_sector_outer_deg))
+        )
+
+        right_sector = (
+            valid
+            & (rel_angles <= math.radians(self.right_sector_inner_deg))
+            & (rel_angles >= math.radians(self.right_sector_outer_deg))
+        )
+
+        # Convert LiDAR points to base_link frame.
+        # The lab notes state laser x-axis is opposite to base_link x-axis. :contentReference[oaicite:2]{index=2}
+        # Using the same 180-degree reversal:
+        # p_base = [-r cos(phi), -r sin(phi)]
+        px = -ranges * np.cos(angles)
+        py = -ranges * np.sin(angles)
+
+        left_points = np.column_stack((px[left_sector], py[left_sector]))
+        right_points = np.column_stack((px[right_sector], py[right_sector]))
+
+        # =========================================================
+        # Step 3: Solve QP for parallel separating lines (Eq. 29)
+        # =========================================================
+        qp_ok = False
+        if len(left_points) >= self.min_points_each_side and len(right_points) >= self.min_points_each_side:
+            try:
+                # Decision variable x = [w_x, w_y, s]^T
+                G = np.array([
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, self.qp_reg]
+                ], dtype=float)
+                a_vec = np.zeros(3, dtype=float)
+
+                C_cols = []
+                b_list = []
+
+                # Right obstacle constraints: w^T p_i + s >= 1
+                for p in right_points:
+                    C_cols.append([p[0], p[1], 1.0])
+                    b_list.append(1.0)
+
+                # Left obstacle constraints: w^T p_j + s <= -1
+                # -> -w^T p_j - s >= 1
+                for p in left_points:
+                    C_cols.append([-p[0], -p[1], -1.0])
+                    b_list.append(1.0)
+
+                # -1 + eps <= s <= 1 - eps
+                # s >= -1 + eps  -> [0,0,1]^T x >= -1 + eps
+                # -s >= -1 + eps -> [0,0,-1]^T x >= -1 + eps
+                C_cols.append([0.0, 0.0, 1.0])
+                b_list.append(-1.0 + self.epsilon_s)
+
+                C_cols.append([0.0, 0.0, -1.0])
+                b_list.append(-1.0 + self.epsilon_s)
+
+                C = np.array(C_cols, dtype=float).T
+                b = np.array(b_list, dtype=float)
+
+                sol = quadprog.solve_qp(G, a_vec, C, b, 0)[0]
+                w = np.array([sol[0], sol[1]], dtype=float)
+                s = float(sol[2])
+
+                # =================================================
+                # Step 4: Compute variables for feedback-linearizing PD
+                # using Eqs. (30)-(37)
+                # =================================================
+                if abs(s - 1.0) > 1e-6 and abs(s + 1.0) > 1e-6:
+                    w_r = w / (s - 1.0)
+                    w_l = w / (s + 1.0)
+
+                    norm_wr = np.linalg.norm(w_r)
+                    norm_wl = np.linalg.norm(w_l)
+
+                    if norm_wr > 1e-6 and norm_wl > 1e-6:
+                        d_r = 1.0 / norm_wr
+                        d_l = 1.0 / norm_wl
+
+                        w_hat_r = d_r * w_r
+                        w_hat_l = d_l * w_l
+
+                        d_r_dot = np.dot(np.array([self.v_s, 0.0]), w_hat_r)
+                        d_l_dot = np.dot(np.array([self.v_s, 0.0]), w_hat_l)
+
+                        cos_alpha_r = np.dot(np.array([0.0, 1.0]), w_hat_r)
+                        cos_alpha_l = np.dot(np.array([0.0, -1.0]), w_hat_l)
+
+                        d_lr = d_l - d_r
+                        d_lr_dot = d_l_dot - d_r_dot
+                        d_lr_tilde = d_lr - self.d_lr_des
+
+                        v_eff = max(abs(self.v_s), self.min_speed_for_steer)
+                        denom = v_eff * v_eff * (cos_alpha_r + cos_alpha_l)
+
+                        if abs(denom) > 1e-6:
+                            delta = math.atan(
+                                (-self.wheelbase / denom) *
+                                (-self.k_p * d_lr_tilde - self.k_d * d_lr_dot)
+                            )
+                        else:
+                            delta = 0.0
+
+                        delta_c = self.clamp(delta, -self.delta_max, self.delta_max)
+                        qp_ok = True
+                    else:
+                        delta_c = 0.0
+                else:
+                    delta_c = 0.0
+            except Exception:
+                delta_c = 0.0
+        else:
+            delta_c = 0.0
+
+        # =========================================================
+        # Step 5: Velocity control from Eq. (20)
+        # =========================================================
+        front_half = math.radians(self.front_view_deg / 2.0)
+        front_mask = valid & (angles >= -front_half) & (angles <= front_half)
+
+        if np.count_nonzero(front_mask) > 0:
+            d_ob = float(np.min(ranges[front_mask]))
+        else:
+            d_ob = 10.0
+
+        v_s_c = self.v_s_desired * (1.0 - math.exp(-max(d_ob - self.d_stop, 0.0) / self.d_tau))
+
+        # Slow further if QP failed, to be safer
+        if not qp_ok:
+            v_s_c = min(v_s_c, 0.25)
+
+        # Publish
+        msg = AckermannDriveStamped()
+        msg.header.stamp = rospy.Time.now()
+        msg.header.frame_id = "base_link"
+        msg.drive.steering_angle = delta_c
+        msg.drive.speed = v_s_c
+        self.drive_pub.publish(msg)
+
+
+def main(args):
+    rospy.init_node("virtual_barrier_navigation_node", anonymous=True)
+    VirtualBarrierNavigation()
+    rospy.sleep(0.1)
+    rospy.spin()
+
+
+if __name__ == "__main__":
+    main(sys.argv)
