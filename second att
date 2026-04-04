@@ -25,28 +25,34 @@ class VirtualBarrierNavigation(object):
         self.d_lr_des = rospy.get_param("d_lr_des", 0.0)
         self.delta_max = rospy.get_param("delta_max", 0.41)
 
-        # LiDAR wall / barrier sector parameters
-        self.angle_b_l = rospy.get_param("angle_b_l", math.radians(90.0))
-        self.angle_a_l = rospy.get_param("angle_a_l", math.radians(40.0))
-        self.angle_b_r = rospy.get_param("angle_b_r", math.radians(-90.0))
-        self.angle_a_r = rospy.get_param("angle_a_r", math.radians(-40.0))
+        # Sectors relative to chosen direction of travel
+        self.angle_b_l = rospy.get_param("angle_b_l", 1.5708)   # +90 deg
+        self.angle_a_l = rospy.get_param("angle_a_l", 0.6981)   # +40 deg
+        self.angle_b_r = rospy.get_param("angle_b_r", -1.5708)  # -90 deg
+        self.angle_a_r = rospy.get_param("angle_a_r", -0.6981)  # -40 deg
 
-        self.n_pts_l = rospy.get_param("n_pts_l", 100)
-        self.n_pts_r = rospy.get_param("n_pts_r", 100)
+        self.n_pts_l = int(rospy.get_param("n_pts_l", 100))
+        self.n_pts_r = int(rospy.get_param("n_pts_r", 100))
 
-        # Best-direction / obstacle parameters
+        # Obstacle / speed parameters
         self.safe_distance = rospy.get_param("safe_distance", 0.95)
-        self.delta_theta = rospy.get_param("delta_theta", 0.30)   # radians
-        self.d_stop = rospy.get_param("d_stop", 0.55)
+        self.delta_theta = rospy.get_param("delta_theta", 0.30)
+        self.d_stop = rospy.get_param("d_stop", 0.52)
         self.d_tau = rospy.get_param("d_tau", 0.9)
 
-        # Speeds
         self.vehicle_velocity = rospy.get_param("vehicle_velocity", 0.9)
-        self.turn_velocity = rospy.get_param("turn_velocity", 0.40)
+        self.turn_velocity = rospy.get_param("turn_velocity", 0.45)
         self.velocity_zero = rospy.get_param("velocity_zero", 0.22)
-        self.v_s_desired = rospy.get_param("v_s_d", 0.60)
+        self.v_s_desired = rospy.get_param("v_s_d", 0.65)
 
-        # QP parameters
+        # Misc params that may exist in your yaml
+        self.CenterOffset = rospy.get_param("CenterOffset", 0.0)
+        self.DistanceLeft = rospy.get_param("DistanceLeft", 0.9)
+        self.DistanceRight = rospy.get_param("DistanceRight", 0.9)
+        self.TrackWall = rospy.get_param("TrackWall", 0)
+        self.tau = rospy.get_param("tau", 0.1)
+
+        # QP setup
         self.epsilon_s = 0.01
         self.qp_reg = 1e-4
         self.min_points_each_side = 3
@@ -54,6 +60,8 @@ class VirtualBarrierNavigation(object):
 
         # State
         self.v_s = 0.0
+        self.corner_turn_active = False
+        self.corner_turn_dir = 0   # -1 = left in your simulator sign convention, +1 = right
 
         rospy.Subscriber(self.scan_topic, LaserScan, self.lidar_callback, queue_size=1)
         rospy.Subscriber(self.odom_topic, Odometry, self.odom_callback, queue_size=1)
@@ -69,11 +77,7 @@ class VirtualBarrierNavigation(object):
             angle += 2.0 * math.pi
         return angle
 
-    def get_sector_indices(self, angles, start_angle, end_angle):
-        idx = np.where((angles >= start_angle) & (angles <= end_angle))[0]
-        return idx
-
-    def get_sector_avg(self, ranges, angles, start_deg, end_deg):
+    def sector_values(self, ranges, angles, start_deg, end_deg):
         start_rad = math.radians(start_deg)
         end_rad = math.radians(end_deg)
         idx = np.where((angles >= start_rad) & (angles <= end_rad))[0]
@@ -83,19 +87,16 @@ class VirtualBarrierNavigation(object):
             r = ranges[i]
             if np.isfinite(r) and r > 0.0:
                 vals.append(r)
+        return vals
 
+    def sector_avg(self, ranges, angles, start_deg, end_deg):
+        vals = self.sector_values(ranges, angles, start_deg, end_deg)
         if len(vals) == 0:
             return 0.0
-        return sum(vals) / float(len(vals))
+        return float(sum(vals)) / float(len(vals))
 
-    def get_front_min_distance(self, ranges, angles, half_angle_rad):
-        idx = np.where((angles >= -half_angle_rad) & (angles <= half_angle_rad))[0]
-        vals = []
-        for i in idx:
-            r = ranges[i]
-            if np.isfinite(r) and r > 0.0:
-                vals.append(r)
-
+    def sector_min(self, ranges, angles, start_deg, end_deg):
+        vals = self.sector_values(ranges, angles, start_deg, end_deg)
         if len(vals) == 0:
             return 10.0
         return min(vals)
@@ -112,9 +113,10 @@ class VirtualBarrierNavigation(object):
             return
 
         # ---------------------------------------------------------
-        # Step 1: Find best direction of travel from largest gap
+        # 1) Best direction of travel from largest front gap
         # ---------------------------------------------------------
-        in_front = (angles >= -math.radians(70.0)) & (angles <= math.radians(70.0)) & valid
+        fov_half = math.radians(70.0)
+        in_front = valid & (angles >= -fov_half) & (angles <= fov_half)
 
         free_mask = np.zeros(len(ranges), dtype=bool)
         free_mask[in_front] = ranges[in_front] > self.safe_distance
@@ -138,7 +140,7 @@ class VirtualBarrierNavigation(object):
                         best_end = idx - 1
                     current_start = -1
 
-        if current_start != -1:
+        if current_start != -1 and len(front_indices) > 0:
             curr_len = front_indices[-1] - current_start + 1
             if curr_len > best_len:
                 best_len = curr_len
@@ -158,7 +160,7 @@ class VirtualBarrierNavigation(object):
                 theta_des = float(np.sum(r_gap * a_gap) / np.sum(r_gap))
 
         # ---------------------------------------------------------
-        # Step 2: Build left/right point sets relative to theta_des
+        # 2) Build left/right point sets relative to theta_des
         # ---------------------------------------------------------
         rel_angles = np.array([self.wrap_to_pi(a - theta_des) for a in angles])
 
@@ -173,8 +175,7 @@ class VirtualBarrierNavigation(object):
         if len(right_idx) > self.n_pts_r:
             right_idx = right_idx[:self.n_pts_r]
 
-        # Convert LiDAR points to base_link-like coordinates
-        # This sign convention matches what worked in your simulator.
+        # LiDAR-to-base coordinate mapping consistent with your simulator sign usage
         px = -ranges * np.cos(angles)
         py = -ranges * np.sin(angles)
 
@@ -182,7 +183,7 @@ class VirtualBarrierNavigation(object):
         right_points = np.column_stack((px[right_idx], py[right_idx])) if len(right_idx) > 0 else np.zeros((0, 2))
 
         # ---------------------------------------------------------
-        # Step 3: Solve QP for virtual barriers
+        # 3) Solve QP for virtual barriers
         # ---------------------------------------------------------
         qp_ok = False
         delta_c = 0.0
@@ -200,12 +201,12 @@ class VirtualBarrierNavigation(object):
                 C_cols = []
                 b_vals = []
 
-                # Right side: w^T p + s >= 1
+                # Right side points: w^T p + s >= 1
                 for p in right_points:
                     C_cols.append([p[0], p[1], 1.0])
                     b_vals.append(1.0)
 
-                # Left side: w^T p + s <= -1  ->  -w^T p - s >= 1
+                # Left side points: w^T p + s <= -1 -> -w^T p - s >= 1
                 for p in left_points:
                     C_cols.append([-p[0], -p[1], -1.0])
                     b_vals.append(1.0)
@@ -252,7 +253,7 @@ class VirtualBarrierNavigation(object):
                         denom = v_eff * v_eff * (cos_alpha_r + cos_alpha_l)
 
                         if abs(denom) > 1e-6:
-                            # This steering sign matches the version you said fixed the left-wall issue.
+                            # Positive sign here is the version you said fixed the left-wall issue earlier
                             delta = math.atan(
                                 (+self.wheelbase / denom) *
                                 (-self.k_p * d_lr_tilde - self.k_d * d_lr_dot)
@@ -266,9 +267,9 @@ class VirtualBarrierNavigation(object):
                 qp_ok = False
 
         # ---------------------------------------------------------
-        # Step 4: Speed control from front obstacle distance
+        # 4) Speed control
         # ---------------------------------------------------------
-        d_ob = self.get_front_min_distance(ranges, angles, self.delta_theta / 2.0)
+        d_ob = self.sector_min(ranges, angles, -math.degrees(self.delta_theta / 2.0), math.degrees(self.delta_theta / 2.0))
 
         v_s_c = self.v_s_desired * (1.0 - math.exp(-max(d_ob - self.d_stop, 0.0) / self.d_tau))
         v_s_c = max(v_s_c, self.velocity_zero)
@@ -278,19 +279,27 @@ class VirtualBarrierNavigation(object):
             v_s_c = min(v_s_c, 0.25)
 
         # ---------------------------------------------------------
-        # Step 5: Final top-left turn override
-        # After clearing the last box, force left if wall is ahead.
+        # 5) Latched final-corner logic
+        # Only activate when wall is ahead, right side is tight, and left side is clearly more open.
+        # In your simulator, left turn corresponds to negative steering.
         # ---------------------------------------------------------
-        front_left = self.get_sector_avg(ranges, angles, 20, 80)
-        front_right = self.get_sector_avg(ranges, angles, -80, -20)
+        front_left = self.sector_avg(ranges, angles, 20, 80)
+        front_right = self.sector_avg(ranges, angles, -80, -20)
 
-        if d_ob < 0.95:
-            # In your simulator, left turn corresponds to negative steering.
-            if front_left > front_right:
-                delta_c = -self.delta_max
-            else:
-                delta_c = self.delta_max
+        activate_left_corner = (d_ob < 0.78 and front_right < 0.60 and front_left > (front_right + 0.18))
+
+        if activate_left_corner:
+            self.corner_turn_active = True
+            self.corner_turn_dir = -1
+
+        if self.corner_turn_active:
+            delta_c = self.corner_turn_dir * self.delta_max
             v_s_c = min(v_s_c, self.turn_velocity)
+
+            # Release after the corner opens up again
+            if d_ob > 1.05 and front_left > 0.90:
+                self.corner_turn_active = False
+                self.corner_turn_dir = 0
 
         # ---------------------------------------------------------
         # Publish
