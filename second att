@@ -1,0 +1,309 @@
+#!/usr/bin/env python
+from __future__ import print_function
+
+import math
+import numpy as np
+import rospy
+import quadprog
+
+from sensor_msgs.msg import LaserScan
+from nav_msgs.msg import Odometry
+from ackermann_msgs.msg import AckermannDriveStamped
+
+
+class VirtualBarrierNavigation(object):
+    def __init__(self):
+        # Topics
+        self.scan_topic = rospy.get_param("scan_topic", "/scan")
+        self.odom_topic = rospy.get_param("odom_topic", "/odom")
+        self.drive_topic = rospy.get_param("drive_topic", "/drive")
+
+        # Vehicle / controller parameters
+        self.wheelbase = rospy.get_param("wheelbase", 0.287)
+        self.k_p = rospy.get_param("k_p", 4.0)
+        self.k_d = rospy.get_param("k_d", 3.0)
+        self.d_lr_des = rospy.get_param("d_lr_des", 0.0)
+        self.delta_max = rospy.get_param("delta_max", 0.41)
+
+        # LiDAR wall / barrier sector parameters
+        self.angle_b_l = rospy.get_param("angle_b_l", math.radians(90.0))
+        self.angle_a_l = rospy.get_param("angle_a_l", math.radians(40.0))
+        self.angle_b_r = rospy.get_param("angle_b_r", math.radians(-90.0))
+        self.angle_a_r = rospy.get_param("angle_a_r", math.radians(-40.0))
+
+        self.n_pts_l = rospy.get_param("n_pts_l", 100)
+        self.n_pts_r = rospy.get_param("n_pts_r", 100)
+
+        # Best-direction / obstacle parameters
+        self.safe_distance = rospy.get_param("safe_distance", 0.95)
+        self.delta_theta = rospy.get_param("delta_theta", 0.30)   # radians
+        self.d_stop = rospy.get_param("d_stop", 0.55)
+        self.d_tau = rospy.get_param("d_tau", 0.9)
+
+        # Speeds
+        self.vehicle_velocity = rospy.get_param("vehicle_velocity", 0.9)
+        self.turn_velocity = rospy.get_param("turn_velocity", 0.40)
+        self.velocity_zero = rospy.get_param("velocity_zero", 0.22)
+        self.v_s_desired = rospy.get_param("v_s_d", 0.60)
+
+        # QP parameters
+        self.epsilon_s = 0.01
+        self.qp_reg = 1e-4
+        self.min_points_each_side = 3
+        self.min_speed_for_steer = 0.25
+
+        # State
+        self.v_s = 0.0
+
+        rospy.Subscriber(self.scan_topic, LaserScan, self.lidar_callback, queue_size=1)
+        rospy.Subscriber(self.odom_topic, Odometry, self.odom_callback, queue_size=1)
+        self.drive_pub = rospy.Publisher(self.drive_topic, AckermannDriveStamped, queue_size=1)
+
+    def clamp(self, x, lo, hi):
+        return max(lo, min(hi, x))
+
+    def wrap_to_pi(self, angle):
+        while angle > math.pi:
+            angle -= 2.0 * math.pi
+        while angle < -math.pi:
+            angle += 2.0 * math.pi
+        return angle
+
+    def get_sector_indices(self, angles, start_angle, end_angle):
+        idx = np.where((angles >= start_angle) & (angles <= end_angle))[0]
+        return idx
+
+    def get_sector_avg(self, ranges, angles, start_deg, end_deg):
+        start_rad = math.radians(start_deg)
+        end_rad = math.radians(end_deg)
+        idx = np.where((angles >= start_rad) & (angles <= end_rad))[0]
+
+        vals = []
+        for i in idx:
+            r = ranges[i]
+            if np.isfinite(r) and r > 0.0:
+                vals.append(r)
+
+        if len(vals) == 0:
+            return 0.0
+        return sum(vals) / float(len(vals))
+
+    def get_front_min_distance(self, ranges, angles, half_angle_rad):
+        idx = np.where((angles >= -half_angle_rad) & (angles <= half_angle_rad))[0]
+        vals = []
+        for i in idx:
+            r = ranges[i]
+            if np.isfinite(r) and r > 0.0:
+                vals.append(r)
+
+        if len(vals) == 0:
+            return 10.0
+        return min(vals)
+
+    def odom_callback(self, msg):
+        self.v_s = msg.twist.twist.linear.x
+
+    def lidar_callback(self, scan):
+        ranges = np.array(scan.ranges, dtype=float)
+        angles = scan.angle_min + np.arange(len(ranges)) * scan.angle_increment
+
+        valid = np.isfinite(ranges) & (ranges > 0.0)
+        if np.count_nonzero(valid) == 0:
+            return
+
+        # ---------------------------------------------------------
+        # Step 1: Find best direction of travel from largest gap
+        # ---------------------------------------------------------
+        in_front = (angles >= -math.radians(70.0)) & (angles <= math.radians(70.0)) & valid
+
+        free_mask = np.zeros(len(ranges), dtype=bool)
+        free_mask[in_front] = ranges[in_front] > self.safe_distance
+
+        front_indices = np.where(in_front)[0]
+        best_start = -1
+        best_end = -1
+        best_len = 0
+        current_start = -1
+
+        for idx in front_indices:
+            if free_mask[idx]:
+                if current_start == -1:
+                    current_start = idx
+            else:
+                if current_start != -1:
+                    curr_len = idx - current_start
+                    if curr_len > best_len:
+                        best_len = curr_len
+                        best_start = current_start
+                        best_end = idx - 1
+                    current_start = -1
+
+        if current_start != -1:
+            curr_len = front_indices[-1] - current_start + 1
+            if curr_len > best_len:
+                best_len = curr_len
+                best_start = current_start
+                best_end = front_indices[-1]
+
+        if best_start == -1 or best_end == -1:
+            theta_des = 0.0
+        else:
+            gap_idx = np.arange(best_start, best_end + 1)
+            gap_idx = gap_idx[valid[gap_idx]]
+            if len(gap_idx) == 0:
+                theta_des = 0.0
+            else:
+                r_gap = ranges[gap_idx]
+                a_gap = angles[gap_idx]
+                theta_des = float(np.sum(r_gap * a_gap) / np.sum(r_gap))
+
+        # ---------------------------------------------------------
+        # Step 2: Build left/right point sets relative to theta_des
+        # ---------------------------------------------------------
+        rel_angles = np.array([self.wrap_to_pi(a - theta_des) for a in angles])
+
+        left_mask = valid & (rel_angles >= self.angle_a_l) & (rel_angles <= self.angle_b_l)
+        right_mask = valid & (rel_angles >= self.angle_b_r) & (rel_angles <= self.angle_a_r)
+
+        left_idx = np.where(left_mask)[0]
+        right_idx = np.where(right_mask)[0]
+
+        if len(left_idx) > self.n_pts_l:
+            left_idx = left_idx[:self.n_pts_l]
+        if len(right_idx) > self.n_pts_r:
+            right_idx = right_idx[:self.n_pts_r]
+
+        # Convert LiDAR points to base_link-like coordinates
+        # This sign convention matches what worked in your simulator.
+        px = -ranges * np.cos(angles)
+        py = -ranges * np.sin(angles)
+
+        left_points = np.column_stack((px[left_idx], py[left_idx])) if len(left_idx) > 0 else np.zeros((0, 2))
+        right_points = np.column_stack((px[right_idx], py[right_idx])) if len(right_idx) > 0 else np.zeros((0, 2))
+
+        # ---------------------------------------------------------
+        # Step 3: Solve QP for virtual barriers
+        # ---------------------------------------------------------
+        qp_ok = False
+        delta_c = 0.0
+
+        if len(left_points) >= self.min_points_each_side and len(right_points) >= self.min_points_each_side:
+            try:
+                # x = [w_x, w_y, s]^T
+                G = np.array([
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, self.qp_reg]
+                ], dtype=float)
+                a_vec = np.zeros(3, dtype=float)
+
+                C_cols = []
+                b_vals = []
+
+                # Right side: w^T p + s >= 1
+                for p in right_points:
+                    C_cols.append([p[0], p[1], 1.0])
+                    b_vals.append(1.0)
+
+                # Left side: w^T p + s <= -1  ->  -w^T p - s >= 1
+                for p in left_points:
+                    C_cols.append([-p[0], -p[1], -1.0])
+                    b_vals.append(1.0)
+
+                # -1 + eps <= s <= 1 - eps
+                C_cols.append([0.0, 0.0, 1.0])
+                b_vals.append(-1.0 + self.epsilon_s)
+
+                C_cols.append([0.0, 0.0, -1.0])
+                b_vals.append(-1.0 + self.epsilon_s)
+
+                C = np.array(C_cols, dtype=float).T
+                b = np.array(b_vals, dtype=float)
+
+                sol = quadprog.solve_qp(G, a_vec, C, b, 0)[0]
+                w = np.array([sol[0], sol[1]], dtype=float)
+                s = float(sol[2])
+
+                if abs(s - 1.0) > 1e-6 and abs(s + 1.0) > 1e-6:
+                    w_r = w / (s - 1.0)
+                    w_l = w / (s + 1.0)
+
+                    norm_wr = np.linalg.norm(w_r)
+                    norm_wl = np.linalg.norm(w_l)
+
+                    if norm_wr > 1e-6 and norm_wl > 1e-6:
+                        d_r = 1.0 / norm_wr
+                        d_l = 1.0 / norm_wl
+
+                        w_hat_r = d_r * w_r
+                        w_hat_l = d_l * w_l
+
+                        d_r_dot = np.dot(np.array([self.v_s, 0.0]), w_hat_r)
+                        d_l_dot = np.dot(np.array([self.v_s, 0.0]), w_hat_l)
+
+                        cos_alpha_r = np.dot(np.array([0.0, 1.0]), w_hat_r)
+                        cos_alpha_l = np.dot(np.array([0.0, -1.0]), w_hat_l)
+
+                        d_lr = d_l - d_r
+                        d_lr_dot = d_l_dot - d_r_dot
+                        d_lr_tilde = d_lr - self.d_lr_des
+
+                        v_eff = max(abs(self.v_s), self.min_speed_for_steer)
+                        denom = v_eff * v_eff * (cos_alpha_r + cos_alpha_l)
+
+                        if abs(denom) > 1e-6:
+                            # This steering sign matches the version you said fixed the left-wall issue.
+                            delta = math.atan(
+                                (+self.wheelbase / denom) *
+                                (-self.k_p * d_lr_tilde - self.k_d * d_lr_dot)
+                            )
+                        else:
+                            delta = 0.0
+
+                        delta_c = self.clamp(delta, -self.delta_max, self.delta_max)
+                        qp_ok = True
+            except Exception:
+                qp_ok = False
+
+        # ---------------------------------------------------------
+        # Step 4: Speed control from front obstacle distance
+        # ---------------------------------------------------------
+        d_ob = self.get_front_min_distance(ranges, angles, self.delta_theta / 2.0)
+
+        v_s_c = self.v_s_desired * (1.0 - math.exp(-max(d_ob - self.d_stop, 0.0) / self.d_tau))
+        v_s_c = max(v_s_c, self.velocity_zero)
+
+        if not qp_ok:
+            delta_c = 0.0
+            v_s_c = min(v_s_c, 0.25)
+
+        # ---------------------------------------------------------
+        # Step 5: Final top-left turn override
+        # After clearing the last box, force left if wall is ahead.
+        # ---------------------------------------------------------
+        front_left = self.get_sector_avg(ranges, angles, 20, 80)
+        front_right = self.get_sector_avg(ranges, angles, -80, -20)
+
+        if d_ob < 0.95:
+            # In your simulator, left turn corresponds to negative steering.
+            if front_left > front_right:
+                delta_c = -self.delta_max
+            else:
+                delta_c = self.delta_max
+            v_s_c = min(v_s_c, self.turn_velocity)
+
+        # ---------------------------------------------------------
+        # Publish
+        # ---------------------------------------------------------
+        msg = AckermannDriveStamped()
+        msg.header.stamp = rospy.Time.now()
+        msg.header.frame_id = "base_link"
+        msg.drive.steering_angle = delta_c
+        msg.drive.speed = v_s_c
+        self.drive_pub.publish(msg)
+
+
+if __name__ == "__main__":
+    rospy.init_node("navigation")
+    VirtualBarrierNavigation()
+    rospy.spin()
