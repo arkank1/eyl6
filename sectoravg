@@ -1,22 +1,22 @@
-def get_sector_avg(self, ranges, angle_min, angle_increment, start_deg, end_deg):
-    start_rad = math.radians(start_deg)
-    end_rad = math.radians(end_deg)
+    def get_sector_avg(self, ranges, angle_min, angle_increment, start_deg, end_deg):
+        start_rad = math.radians(start_deg)
+        end_rad = math.radians(end_deg)
 
-    i0 = int(round((start_rad - angle_min) / angle_increment))
-    i1 = int(round((end_rad - angle_min) / angle_increment))
+        i0 = int(round((start_rad - angle_min) / angle_increment))
+        i1 = int(round((end_rad - angle_min) / angle_increment))
 
-    i0 = max(0, min(len(ranges) - 1, i0))
-    i1 = max(0, min(len(ranges) - 1, i1))
+        i0 = max(0, min(len(ranges) - 1, i0))
+        i1 = max(0, min(len(ranges) - 1, i1))
 
-    if i0 > i1:
-        i0, i1 = i1, i0
+        if i0 > i1:
+            i0, i1 = i1, i0
 
-    vals = []
-    for i in range(i0, i1 + 1):
-        r = ranges[i]
-        if np.isfinite(r) and r > 0.0:
-            vals.append(r)
+        vals = []
+        for i in range(i0, i1 + 1):
+            r = ranges[i]
+            if np.isfinite(r) and r > 0.0:
+                vals.append(r)
 
-    if len(vals) == 0:
-        return 0.0
-    return sum(vals) / float(len(vals))
+        if len(vals) == 0:
+            return 0.0
+        return sum(vals) / float(len(vals))
