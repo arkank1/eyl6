@@ -27,15 +27,15 @@ class GapBarrier:
         # speed and steering
         self.max_speed          = rospy.get_param('max_speed',          1.0)
         self.max_steering_angle = rospy.get_param('max_steering_angle', 0.4189)
-        self.target_speed       = rospy.get_param('target_speed',       0.8)
+        self.target_speed       = rospy.get_param('target_speed',       1.5)
 
         # lidar
-        self.front_fov_deg        = rospy.get_param('front_fov_deg',        100.0)
+        self.front_fov_deg        = rospy.get_param('front_fov_deg',        180.0)
         self.max_lidar_range      = rospy.get_param('max_lidar_range',      10.0)
         self.min_lidar_range      = rospy.get_param('min_lidar_range',      0.05)
-        self.safety_bubble_radius = rospy.get_param('safety_bubble_radius', 10)
-        self.front_speed_window   = rospy.get_param('front_speed_window',   12)
-        self.danger_distance      = rospy.get_param('danger_distance',      0.9)
+        self.safety_bubble_radius = rospy.get_param('safety_bubble_radius', 22)
+        self.front_speed_window   = rospy.get_param('front_speed_window',   25)
+        self.danger_distance      = rospy.get_param('danger_distance',      1.6)
 
         # subscribers and publishers
         self.drive_pub = rospy.Publisher(rospy.get_param('drive_topic', '/drive'), AckermannDriveStamped, queue_size=1)
@@ -43,8 +43,10 @@ class GapBarrier:
         self.joy_sub   = rospy.Subscriber(rospy.get_param('joy_topic',  '/joy'),   Joy,       self.joy_callback,   queue_size=1)
         self.scan_sub  = rospy.Subscriber(rospy.get_param('scan_topic', '/scan'),  LaserScan, self.lidar_callback, queue_size=1)
 
+
     def getWalls(self, left_obstacles, right_obstacles, wl0, wr0, alpha):
         return wl0, wr0, 0.0, 0.0
+
 
     def apply_safety_bubble(self, ranges):
         out = np.array(ranges, copy=True)
@@ -54,6 +56,7 @@ class GapBarrier:
             hi = min(len(out), i + self.safety_bubble_radius + 1)
             out[lo:hi] = 0.0
         return out
+
 
     def find_max_gap(self, ranges):
         gs = ge = best = 0
@@ -72,6 +75,7 @@ class GapBarrier:
                 gs, ge = cur, len(ranges)
         return gs, ge
 
+
     def find_best_point(self, gs, ge, ranges):
         if ge <= gs:
             return len(ranges) // 2
@@ -82,8 +86,10 @@ class GapBarrier:
             return (gs + ge) // 2
         return (ss + se) // 2
 
+
     def odom_callback(self, odom_msg):
         self.vel = odom_msg.twist.twist.linear.x
+
 
     def joy_callback(self, joy_msg):
         if len(joy_msg.buttons) > self.lb_button_index and joy_msg.buttons[self.lb_button_index] == 1:
@@ -98,6 +104,7 @@ class GapBarrier:
             self.manual_speed = self.max_speed          * spd
             self.manual_steer = self.max_steering_angle * steer
             self._send(self.manual_steer, self.manual_speed)
+
 
     def lidar_callback(self, data):
         if self.manual_mode:
@@ -117,6 +124,7 @@ class GapBarrier:
         i0  = max(0, mid - hw)
         i1  = min(N, mid + hw)
         r   = np.array(r[i0:i1], copy=True)
+        mid = len(r) // 2  # recalculate mid relative to the trimmed array
 
         if len(r) == 0:
             self._send(0.0, 0.0)
@@ -137,36 +145,41 @@ class GapBarrier:
         angle    = data.angle_min + bp_glob * data.angle_increment
 
         # compute and clip steering command
-        steer = float(np.clip(1.6 * angle, -self.max_steering_angle, self.max_steering_angle))
+        steer = float(np.clip(2.0 * angle, -self.max_steering_angle, self.max_steering_angle))
 
         # compute speed from front clearance
-        local_mid = len(r) // 2
         hw2   = self.front_speed_window
-        seg   = r[max(0, local_mid - hw2) : min(len(r), local_mid + hw2 + 1)]
+        seg   = r[max(0, mid - hw2) : min(len(r), mid + hw2 + 1)]
         valid = [x for x in seg if x > self.min_lidar_range]
         d_min = min(valid) if valid else self.max_lidar_range
 
-        if d_min < 0.20:
+        if d_min < 0.3:
             spd = 0.0
-        elif d_min < 0.35:
-            spd = 0.25
-        elif d_min < 0.55:
-            spd = 0.40
+        elif d_min < 0.5:
+            spd = 0.6
+        elif d_min < 0.8:
+            spd = 0.9
         else:
             spd = self.target_speed
 
         spd = min(spd, self.max_speed)
 
-        # slow down on sharp turns, but less aggressively
-        spd = spd * (1.0 - 0.45 * abs(steer) / self.max_steering_angle)
-        spd = max(0.18, min(spd, self.max_speed))
+        # slow down proportionally on sharp turns
+        spd = spd * (1.0 - 0.8 * abs(steer) / self.max_steering_angle)
+        spd = max(0.0, min(spd, self.max_speed))
 
-        # softer emergency stop
-        fw = r[max(0, local_mid - 6) : min(len(r), local_mid + 7)]
-        if any(x < 0.30 for x in fw if x > self.min_lidar_range):
+        if d_min < 1.5:
+            spd = min(spd, 0.5)
+        if d_min < 1.0:
+            spd = min(spd, 0.3)
+
+        # emergency stop
+        fw = r[max(0, mid - 10) : min(len(r), mid + 11)]
+        if any(x < 0.7 for x in fw if x > self.min_lidar_range):
             spd = 0.0
 
         self._send(steer, spd)
+
 
     def _send(self, steer, spd):
         msg = AckermannDriveStamped()
